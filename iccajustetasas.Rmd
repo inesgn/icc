@@ -1,0 +1,224 @@
+---
+title: "ajustetasas"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(dplyr)
+require(MASS)
+require(lubridate)
+library(Epi)
+```
+
+
+```{r ajuste tasas discusion}
+## Ajuste de tasas de ingresos para discutir
+
+###    Se trata de ver cual seria la mejor manera de proporcionar una tabla con tasas de eventos 
+#     (ingresos, muerte a los 30 / 365 dias) segun Sexo y Anyos. Tenemos ademas la Edad, que
+#      interviene como variable de ajuste pero no la presentamos de forma directa.
+
+###    Se exploran 2 maneras de hacer los calculos - en ambos casos, partimos de un modelo de Poisson:
+#      --PRIMER CAMINO: Combinar predicciones del modelo sobre una estructura de edad fija (la global)
+#      --SEGUNDO CAMINO: Intentar obtener un exceso de riesgo, observado/esperado, sobre cada estrato
+#                         y aplicar el exceso sobre una tasa global (....Se aclara abajo.....)
+
+
+###    Inputs y outputs:
+#      -- Input: Cargaremos los datos que os pasamos ("basal.rda", "ingresos_pri.rda", "outcome.rda")
+#           y a partir de esas bases reconstruiremos datos de ingresos a 30 dias (ing30), 
+#           unas 15,000 filas con el numero de ingresos
+#
+#       Por otro lado:
+#       Cargaremos un modelo de Poisson ya hecho ("modelo.RData") con variables edad, sexo y anyo de ingreso 
+#      -- Output: creamos y guardamos una tabla "tasas" con tasas crudas y ajustadas por las 2 vias
+
+# Setup -----
+rm(list=ls())
+setwd("~/Documents/Proyectos/osakidetza/icc/Datos proyecto ICC (bases madre)")
+
+# Cargar los datos 
+load("basal.rda")
+load("ingresos_pri.rda")
+load("outcome.rda")
+# cargar el modelo (ya calculado)
+
+setwd("~/Documents/Proyectos/osakidetza/icc")
+load("modelo.RData")
+
+# FASE PREVIA: Crear el data-frame de Ingresos a 30 dias ------
+# (Esto se tiene que reproducir bien).
+#Filtrar pacientes(n=15479)
+outcome <- outcome %>% filter(!is.na(mort30))  # -10 casos?
+basal <- basal %>% filter(id %in% outcome$id)  # nos quitamos poblacion xq no estan en el outcome?
+ingresos_pri <- ingresos_pri %>% filter(id %in% basal$id) 
+
+#Reconstruir la base de ingresos a 30 dias
+#    --- Aqui empieza ----    #
+
+#Ingresos que son posteriores al alta
+ingresos_post <- ingresos_pri %>% 
+  filter(fing > falta_ing1, program == 0) %>% 
+  mutate(dias_desde_alta = fing - falta_ing1) -> ingresos_post
+
+# Construirmos el data-frame inicialmente, sin outcome.
+basal %>% 
+  dplyr::select(id, sexo, edad_ing1, fing_ing1) -> ing30
+
+# Calculos previos (Preparacion de variables)
+ing30$fing_ing1_a <- lubridate::year(basal$fing_ing1)
+ing30$fing_ing1_acat <- factor(ing30$fing_ing1_a)
+ing30$edad_ing1_cat <- ifelse(ing30$edad_ing1 < 50, "[40,50)", 
+                              ifelse(ing30$edad_ing1 < 60, "[50,60)", 
+                                     ifelse(ing30$edad_ing1 < 70, "[60,70)", 
+                                            ifelse(ing30$edad_ing1 < 80,"[70,80)", 
+                                                   ifelse(ing30$edad_ing1 < 90,"[80,90)","90+")))))
+
+# Traernos el outcome: Numero de Ingresos 30 dias
+ingresos_post %>% 
+  mutate(falta_ing1_30d = falta_ing1 + days(30)) %>% 
+  filter(fing <= falta_ing1_30d) %>%
+  group_by(id) %>% 
+  summarise(n_ing = n()) %>% 
+  ungroup() -> out
+#-- unir los data-frames
+ing30 <- merge(x = ing30, y = out, all.x = T )
+# convertir NA a 0
+ing30[is.na(ing30$n_ing), "n_ing"] <- 0 
+names(ing30)[which(names(ing30)=="n_ing")] <- "n_ing_30"
+
+#    --- Aqui Termina: Data-frame ing30 Construido. ----    #
+
+
+# Tasas crudas; por sexo, anyo -----
+# Creamos la estructura basica de la tabla, "tasas", inicialmente con las N y las tasas crudas.
+ing30 %>% 
+  group_by(fing_ing1_acat, sexo) %>% 
+  mutate(i_ing_30 = as.numeric(ifelse(n_ing_30 > 0,1,0))) %>% 
+  summarise(poblacion = n(),
+            n_ingresos = sum(n_ing_30),
+            n_ingresados = sum(i_ing_30),
+            tasa_cruda = n_ingresos/poblacion) -> tasas
+
+# Modelo de Poisson -----
+#Esta ya cargado:
+#    --- el outcome es el numero de ingresos, y las variables:
+#    --- sexo: referencia Hombre
+#    --- edad: 6 categorias, referencia [40,50)
+#    --- anyos: 2011-2015, referencia 2011
+
+# resultado del modelo
+summary(mod_ing30)
+# coeficientes exponenciados
+exp(coef(mod_ing30))
+
+# PRIMER "ajuste" -  Tomamos una distribucion fija de edad para todos los estratos ----
+# La distribucion de edad global es:
+ing30 %>% 
+  group_by(edad_ing1_cat) %>% 
+  summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n),3) * 100)
+
+#Creamos un data-frame que para cada estrato de sexo-anyo, repita la distribucion global de edad:
+df <- data.frame(expand.grid(sexo = unique(ing30$sexo),
+                  fing_ing1_acat = unique(ing30$fing_ing1_acat),
+                  edad_ing1_cat = unique(ing30$edad_ing1_cat)))
+# ----- unirle la distribucion de edad
+df %>% left_join(ing30 %>% 
+                   group_by(edad_ing1_cat) %>% 
+                   summarise(n = n()) %>%
+                   ungroup()) -> df
+str(df)
+
+# Calculamos los valores predichos por el modelo para este data-frame df
+df$predicho <- predict(object = mod_ing30, newdata = df, type = "response")
+
+# Ahora vamos a hacer la suma ponderada con esa distribucion fija. 
+#Por ejemplo: Tasa ajustada para Hombres, 2011:
+df.H.2011 <- df %>% filter(sexo == "Hombre", fing_ing1_acat == "2011")
+df.H.2011
+sum(df.H.2011$n) #Suma toda la poblacion
+#suma ponderada de las predicciones; y dividir por el total 
+sum(df.H.2011$predicho * df.H.2011$n) / sum(df.H.2011$n) 
+
+# Calcular esto para todas las cajas edad, anyo. 
+#Con ello creamos la columna "tasa_ajuste1" en "tasas"
+df %>% 
+  group_by(sexo, fing_ing1_acat) %>% 
+  mutate(pred_ponderado = predicho * n) %>% 
+  summarise(tasa_ajuste1  = sum(pred_ponderado) / sum(n))  %>% 
+  ungroup() %>% 
+  left_join(tasas) -> tasas
+# Ya tenemos el primer camino.
+# ---- ordenar columnas
+tasas <- tasas[, c("sexo", "fing_ing1_acat", "poblacion", "n_ingresos", "n_ingresados",
+               "tasa_cruda", "tasa_ajuste1")]
+View(tasas)
+
+##### Esta tabla "tasas" ya podria ser un resultado, pero probamos por otro camino.
+
+
+# SEGUNDA VIA  ----
+
+#   queremos razonar asi; se parte de una tasa "observada" en cada estrato edad-sexo-anyo,
+#   y se compara con otra tasa, la que se "esperaria" debido (solo) a la distribucion de edad
+#   Entre las dos se obtiene un valor observado / esperado, que finalmente aplicamos sobre una tasa global
+
+#tasa global: n_ing_30 es el numero de eventos por paciente, en 30 dias.
+sum(ing30$n_ing_30) / nrow(ing30) # 0.1740423
+#nos lo guardamos
+tasa_global <- sum(ing30$n_ing_30) / nrow(ing30)
+
+# 1) Valor "observado"
+#Aplicamos el modelo con edad, sexo, anyo
+#valores predichos con predict
+ing30$predicho <- predict(object = mod_ing30, newdata = ing30, type = "response")
+ing30 %>% group_by(sexo, fing_ing1_acat) %>% summarise(tasa_obs = mean(predicho))
+# se lo unimos al data-frame "tasas"
+tasas %>% right_join(ing30 %>% group_by(sexo, fing_ing1_acat) %>% summarise(tasa_obs = mean(predicho))) -> tasas
+
+# 2) Valor "esperado"
+
+#Ahora solo tenemos en cuenta la edad. Podemos usar un modelo, 
+# o directamente sacar las tasas crudas.
+mod_ing30_edad <- MASS::glm.nb(formula = n_ing_30 ~ edad_ing1_cat, data = ing30,link = log)
+summary(mod_ing30_edad)
+exp(coef(mod_ing30_edad))
+
+# para cada estrato de sexo y anyo tenemos en cuenta su estructura de edad:
+df %>% left_join(ing30 %>% 
+                   group_by(sexo, fing_ing1_acat, edad_ing1_cat) %>% 
+                   summarise(n_estrato = n()) %>%
+                   ungroup()) -> df
+df$predicho_modeloedad <- predict(object = mod_ing30_edad, newdata = df, type = "response")
+head(df)
+
+# Se calcula la media ponderada para cada estrato sexo, anyo
+df %>% group_by(sexo, fing_ing1_acat) %>% 
+  summarise(tasa_solo_edad = sum(predicho_modeloedad * n_estrato) / sum(n_estrato)) %>% 
+  ungroup() 
+# Nos lo llevamos a "tasa", donde tenemos todo 
+tasas %>% right_join(df %>% group_by(sexo, fing_ing1_acat) %>% 
+                       summarise(tasa_esp = sum(predicho_modeloedad * n_estrato) / sum(n_estrato)) %>% 
+                       ungroup()) -> tasas
+
+# 3) Calculo final: Dar un "exceso de riesgo" observado/esperado para cada estrato, 
+#        y Aplicarlo sobre la tasa global
+head(tasas)
+head(tasas$tasa_obs / tasas$tasa_esp)
+tasas$obs_esp <- tasas$tasa_obs / tasas$tasa_esp
+tasas$tasa_ajuste2 <- tasa_global * tasas$obs_esp
+
+# guardar resultado -----
+# write.csv2(x = tasas, file ="ajuste_tasas.csv", row.names = F)
+
+```
+
+
+
