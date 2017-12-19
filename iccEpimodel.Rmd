@@ -10,11 +10,12 @@ editor_options:
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-```{r libraries}
+```{r libraries, warning=FALSE, message=FALSE}
 library(dplyr)
 require(MASS)
 require(lubridate)
 library(Epi)
+library(plyr)
 ```
 
 
@@ -34,106 +35,107 @@ recna0<-colwise(function(x){
 ```{r data}
 
 # definiciones
-https://docs.google.com/spreadsheets/d/1UgjUZ6antWgMZQ4zoGu9nlwDG7ngMqYvXQipLimCFNM/edit?ts=5a37ca71#gid=1745466320
+# https://docs.google.com/spreadsheets/d/1UgjUZ6antWgMZQ4zoGu9nlwDG7ngMqYvXQipLimCFNM/edit?ts=5a37ca71#gid=1745466320
 
 # Setup -----
 rm(list=ls())
-setwd("~/Documents/Proyectos/osakidetza/icc/Datos proyecto ICC (bases madre)")
+# setwd("~/Documents/Proyectos/osakidetza/icc/Datos proyecto ICC (bases madre)")
 
 # Cargar los datos 
-load("basal.rda")
-load("ingresos_pri.rda")
-load("outcome.rda")
-# cargar el modelo (ya calculado)
+library(cohorteicc)
+# load("basal.rda")
+# load("ingresos_pri.rda")
+# load("outcome.rda")
+```
 
-
-
-outcome <- outcome %>% filter(!is.na(mort30))  # -10 casos?  se eliminan los que NO SE SABE SI fallece 30 dias despues del ingreso..!
-basal <- basal %>% filter(id %in% outcome$id)  # nos quitamos poblacion xq no estan en el outcome? (nos quedamos sin fallecidos -supongo que son inmediatos-)
+```{r filtrar_bases}
+# Pacientes con fecha de mortalidad desconocida (sabemos que han muerto pero no cuando)
+outcome <- outcome %>% filter(!is.na(mort30)) 
+basal <- basal %>% filter(id %in% outcome$id) 
 ingresos_pri <- ingresos_pri %>% filter(id %in% basal$id) 
+```
 
-# voy a pegar la primera fecha de ingreso postalta indice a la basal-> basalj.. con eso y censurando en diciembre 2015 (como no tenemos los ingresos 2016 -aunque tengamos los fallecimientos..-, para hacerlo cohorente, vamos a trabajar con 31-12-2015 como fin de estudio )
+```{r ingresos_posteriores_alta}
 
-#Ingresos que son posteriores al alta
+#Ingresos urgentes (no programados) que son posteriores al alta
 ingpost <- ingresos_pri %>% 
   filter(fing > falta_ing1, program == 0) %>% 
-  mutate(dias_desde_alta = fing - falta_ing1) -> ingresos_post
+  mutate(dias_desde_alta = fing - falta_ing1)
 # 
 
-# sobre este ingresos_post, por un lado, recojo el detalle del reingreso mas cercano al indice, y por otro un resumen de la evolucion hasta el 12/2015: tiempo de exposicion, numero de ingresos...
-# 
-# names(ingpost)
-# library(dplyr)
-# # saco la primera [pero ya esta en outcomes!!]
-# 
-# ingepi0 <- group_by(ingpost, id)
-# ingepi0 <- filter(ingepi0, rank(dias_desde_alta, ties.method="first")==1)
-# (https://stackoverflow.com/questions/21308436/dplyr-filter-get-rows-with-minimum-of-variable-but-only-the-first-if-multiple)
+```
 
+```{r crear_datos30}
+# voy a pegar la primera fecha de ingreso postalta indice a la basal-> basalj.. con eso y censurando en diciembre 2015 (como no tenemos los ingresos 2016 -aunque tengamos los fallecimientos..-, para hacerlo cohorente, vamos a trabajar con 31-12-2015 como fin de estudio )
+
+#[INES]. de momento solo cogemos un tipo de outcome intermedio: ingresos de todo tipo.
+#pronto tendremos bien clasificados todos los ingresos; hacemos la prueba hasta 31-12-2016.
 
 basalj <- basal
 rm(basal)
-rm(ingresos_post, ingresos_pri)
-# voy a cortar a diciembre 2015.. monto fcen
-basalj$fcen <- ifelse(lubridate::year(basalj$fmort)<2016  & !is.na(basalj$fmort) ,basalj$fmort,as.Date("2015-12-31", "%Y-%m-%d"))
+rm(ingresos_pri)
 
+# Censura en Diciembre 2016.
+basalj %>% right_join(dplyr::select(outcome, id, fmort2)) %>% 
+        mutate( fcen = ifelse(lubridate::year(fmort2) < 2016 & !is.na(fmort2), 
+                fmort2, 
+                as.Date("2016-12-31", "%Y-%m-%d"))) -> basalj
+
+# basalj$fcen <- ifelse(lubridate::year(basalj$fmort)<2016  & !is.na(basalj$fmort) ,basalj$fmort,as.Date("2015-12-31", "%Y-%m-%d"))
 basalj$fcen <- as.Date(basalj$fcen, origin = "1970-01-01")
 
 ## voy a agregarle la fecha del primer ingreso (outcome como distancia) de diverso tipo...
+#[INES] De momento probamos con el primer ingreso de cualquier tipo
 
 names(outcome)
-outj <- dplyr::select(outcome, id, fing1er, fing1er_ic, fing1er_peic)
-rm(outcome)
-basalj <- select(basalj,-c(uap,epi_unico,cie9_ing1))
-basalj <- left_join(basalj,outj)
+outj <- outcome %>% dplyr::select(id, fing1er)
+basalj <- basalj %>% dplyr::select(-uap, -epi_unico, -cie9_ing1)
+basalj <- left_join(basalj, outj)
 rm(outj)
-
+names(basalj)
 # voy a extraer todos lo episodios de hospitalizacion tras el episodio indice -para construir un objeto con todos estos eventos usando cut de Epi (ver abajo)- en principio lo hare ON INGRESOS_ICC Y _CV _HPE (guardare el tipo)
 
 names(ingpost)
-ingpos3 <- dplyr::select(ingpost, id, fing, falta, hpe, ingreso_icc, ingreso_cv)
-ingpos3 <- filter(ingpos3, ingreso_icc==1 | hpe==1 | ingreso_cv==1)
+ingpos3 <- ingpost %>% dplyr::select(id, fing, falta, hpe, ingreso_icc, ingreso_cv) %>%
+        filter(ingreso_icc==1 | hpe==1 | ingreso_cv==1)
 names(ingpos3)[6] <- "tipoi"
 ingpos3$tipoi <- as.factor(ifelse(ingpos3$hpe==1,"3",
                         ifelse(ingpos3$ingreso_icc==1,"2","1")))
 levels(ingpos3$tipoi) <- c("cv","icc_ine","icc_evi")
 table(ingpos3$tipoi) 
-ingpos3 <- dplyr::select(ingpos3,-c(hpe,ingreso_icc))
-
+ingpos3 <- ingpos3 %>% dplyr::select(-hpe, -ingreso_icc)
 
 ingpos3 <- ingpos3 %>%
-  arrange(id, fing) %>%
-  group_by(id) %>%
-  mutate(nh = 1:n()) %>% ungroup()
+  arrange(id, fing) %>% 
+  group_by(id) %>% 
+  dplyr::mutate(nh = 1:n()) %>% 
+        ungroup()
 
 rm(ingpost)
-
 ```
+
 
 
 ```{r modelo en Epi}
 
 # voy a cortar a diciembre 2015.. monto fcen
-basalj$status <- ifelse(lubridate::year(basalj$fmort)<2016  & !is.na(basalj$fmort) ,1,0)
+basalj$status <- ifelse(lubridate::year(basalj$fmort2)<2017  & !is.na(basalj$fmort2) ,1,0)
 
-basalj <- dplyr::select(basalj,-c(causa,fmort, situ, fallecido))
+basalj <- basalj %>% dplyr::select(-causa, -fmort, -situ, -fallecido)
 
-# 
-# basalj$fcen <- ifelse(lubridate::year(basalj$fmort)<2016  & !is.na(basalj$fmort) ,basalj$fmort,as.Date("2015-12-31", "%Y-%m-%d"))
-
+#[INES] de momento ignoramos fing1er_ic,fing1er_peic (seria cuestion de traerlas de outcome)
 
 iccL<- Lexis(entry=list(per=cal.yr(falta_ing1),  agein=edad_ing1),
             exit=list(per=cal.yr(fcen), age=cal.yr(fcen)-cal.yr(fec_nac)),
-            exit.status=factor(status,labels=c("Alive","Death")),data=dplyr::select(basalj,id,sexo,indice_medea,comarca,falta_ing1,fcen,fec_nac,fing1er,fing1er_ic,fing1er_peic, status, edad_ing1))
+            exit.status=factor(status,labels=c("Alive","Death")),data=dplyr::select(basalj,id,sexo,indice_medea,comarca,falta_ing1,fcen,fec_nac,fing1er, status, edad_ing1))
 
 
 summary(iccL)
-# 
+# # 
 # Transitions:
 #      To
 # From    Alive Death  Records:  Events: Risk time:  Persons:
-#   Alive  9313  6127     15440     6127    9531029     15440
-# 
+#   Alive  7691  7769     15460     7769   35374.41     15460
 
 
 plot(iccL,xlim=c(2011,2016),type="b" )  # ??
@@ -160,7 +162,7 @@ ingpos4$new.state <- 1
 
 iccC <- iccL
 
- for(n in 1:20 ) # hay hasta 20 hospitalizaciones
+ for(n in 1:20 ) # hay hasta 20 hospitalizaciones. n=1
  {iccC <- cutLexis(data=iccC, cut=subset(ingpos4,nh==n), "per", count=TRUE )}
 
 ## quiero añadir al objeto tipoi y nh
@@ -174,7 +176,7 @@ rm(ingpos4, iccC)
 rm(basalj)
 rm(n)
 
-)# Splitting the follow-up time along a timescale
+# Splitting the follow-up time along a timescale
 
 # iccS1 <- splitLexis( iccL, "agein", breaks=c(50,60,70,80,90) )
 #  summary( iccL )
@@ -193,11 +195,11 @@ rm(n)
 ```{r rstudio github}
 
 
-http://www.molecularecologist.com/2013/11/using-github-with-r-and-rstudio/
-http://r-bio.github.io/intro-git-rstudio/
-https://jennybc.github.io/2014-05-12-ubc/ubc-r/session03_git.html
-https://www.r-bloggers.com/rstudio-and-github/
-https://support.rstudio.com/hc/en-us/articles/200532077-Version-Control-with-Git-and-SVN
+# http://www.molecularecologist.com/2013/11/using-github-with-r-and-rstudio/
+# http://r-bio.github.io/intro-git-rstudio/
+# https://jennybc.github.io/2014-05-12-ubc/ubc-r/session03_git.html
+# https://www.r-bloggers.com/rstudio-and-github/
+# https://support.rstudio.com/hc/en-us/articles/200532077-Version-Control-with-Git-and-SVN
 
 # git remote rm origen
 # git remote rm destination
@@ -205,9 +207,9 @@ https://support.rstudio.com/hc/en-us/articles/200532077-Version-Control-with-Git
 # git remote add origin https://github.com/jujulijuli/icc.git
 # git config remote.origin.url git@github.com:ewenharrison/test.git
 # git pull -u origin master
-git push -u origin master
-
-https://stackoverflow.com/questions/10298291/cannot-push-to-github-keeps-saying-need-merge
-git push -f # force
+# git push -u origin master
+# 
+# https://stackoverflow.com/questions/10298291/cannot-push-to-github-keeps-saying-need-merge
+# git push -f # force
 ```
 
